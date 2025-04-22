@@ -1,5 +1,7 @@
 # Automatically Create Motion Trail Images with Segment Anything
 
+<img src="media/example.svg" width="500" style="display: block; margin: auto;" />
+
 ## Setup
 
 Download the Segment Anything model from [here](https://github.com/facebookresearch/segment-anything).
