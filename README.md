@@ -1,8 +1,8 @@
 # Automatically Create Motion Trail Images with Segment Anything
 
-<div style="text-align: center;">
+<p align="center">
   <img src="media/example.svg" width="500">
-</div>
+</p>
 
 ## Setup
 
