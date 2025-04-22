@@ -172,3 +172,16 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# workspace settings
+.venv/
+
+data/*
+!data/samples/
+!data/samples/*
+
+outputs/*
+!outputs/sample_result.png
+
+models/*

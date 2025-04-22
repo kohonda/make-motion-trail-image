@@ -1,0 +1,16 @@
+[project]
+name = "make-motion-trail-image"
+version = "0.1.0"
+description = "Make motion trail image using Segment Anything."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fire>=0.7.0",
+    "numpy>=2.2.5",
+    "opencv-python>=4.11.0.86",
+    "pathlib>=1.0.1",
+    "segment-anything>=1.0",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "tqdm>=4.67.1",
+]
