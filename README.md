@@ -36,7 +36,7 @@ uv run main.py --input_images_dir data/samples/
 
 ## Manual Mask Editing
 
-You can manually edit the mask images in the `masks` directory using any image editing tool. After editing, regenerate the final motion-trail image by running:
+You can manually edit the mask images in the generated `data/masks` directory using any image editing tool. After editing, regenerate the final motion-trail image by running:
 
 ```bash
 uv run main.py \
