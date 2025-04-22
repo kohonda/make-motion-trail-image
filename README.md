@@ -1,34 +1,45 @@
-# Automatically create motion trail images using Segment Anything
+# Automatically Create Motion Trail Images with Segment Anything
 
 ## Setup
 
-Download Segment Anything model from [here](https://github.com/facebookresearch/segment-anything).
+Download the Segment Anything model from [here](https://github.com/facebookresearch/segment-anything).
 
-For example,
+For example:
 
 ```bash
 cd make-motion-trail-image
-mkdir models && curl -L https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -o models/sam_vit_h_4b8939.pth
+mkdir -p models
+curl -L https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth \
+  -o models/sam_vit_h_4b8939.pth
 ```
 
-## Run
+## Usage
+
+Run the script with the required options:
 
 ```bash
-uv run main.py --input_images_dir <input_images_dir> --output_path <output_path> --model_path <model_path> 
+uv run main.py \
+  --input_images_dir <input_images_dir> \
+  --output_path <output_path> \
+  --model_path <model_path>
 ```
 
-For example, using our sample images:
+For example, to process the sample images:
 
 ```bash
-python main.py --input_images_dir data/samples/
+uv run main.py --input_images_dir data/samples/
 ```
 
-## Manual adjustment
+## Manual Mask Editing
 
-<!-- masksのimagesを微調整すると結果を修正できるよ -->
-
-You can manually adjust the masks in the `masks` directory using any image editing software. After editing, run the following command to generate the final motion trail image:
+You can manually edit the mask images in the `masks` directory using any image editing tool. After editing, regenerate the final motion-trail image by running:
 
 ```bash
-uv run main.py --input_images_dir <input_images_dir> --output_path <output_path> --model_path <model_path> --masks_dir <masks_dir> --use_masks True
+uv run main.py \
+  --input_images_dir <input_images_dir> \
+  --output_path <output_path> \
+  --model_path <model_path> \
+  --masks_dir <masks_dir> \
+  --use_masks True
 ```
+
