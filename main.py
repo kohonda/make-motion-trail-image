@@ -107,7 +107,7 @@ def main(
     use_mask: bool = False,
     masks_dir: str = "data/masks/",
     min_area: int = 8_000,
-    alpha: float = 0.5,
+    alpha: float = 0.7,
 ) -> None:
     """
     Parameters
