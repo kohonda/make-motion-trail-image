@@ -1,588 +1,250 @@
 #!/usr/bin/env python3
-"""
-Interactive Gradio GUI for motion-trail image creation using SAM 3.
-
-Workflow
--------
-1. Load a directory of frames into a "set".
-2. For each frame, click to place positive / negative point prompts.
-3. SAM 3 segments the object in real time and shows a mask preview.
-4. Navigate frames and annotate each independently.
-5. Add more sets (+), each annotated separately and given its own colour.
-6. Choose one frame as the background, then generate a composite that
-   overlays every set's motion trail in its own colour.
-"""
+"""Motion-trail image creator: Gradio GUI entry point."""
 
 from __future__ import annotations
 
-import platform
-import re
-import subprocess
-from pathlib import Path
+from contextlib import contextmanager
 
-import cv2
 import gradio as gr
-import numpy as np
 
-from core import (
-    compose_multi_set,
-    load_images,
-    run_predictor_on_frame,
+from motion_trail.frames import VIDEO_EXTS
+from motion_trail.session import list_sessions
+from motion_trail.ui.edit import (
+    add_set,
+    change_frame,
+    clear_points,
+    load_image_files,
+    load_video_frames,
+    move_set,
+    on_image_click,
+    on_video_drop,
+    remove_set,
+    select_set,
+    set_background,
+    set_color,
+    toggle_no_color,
+    undo_point,
 )
-
-# ---------------------------------------------------------------------------
-# Visualisation helpers
-# ---------------------------------------------------------------------------
-
-
-def _draw_points(image: np.ndarray, points: list[tuple[int, int, int]]) -> np.ndarray:
-    """Draw coloured circles on *image* for each (x, y, label) tuple."""
-    vis = image.copy()
-    for x, y, label in points:
-        colour = (0, 255, 0) if label == 1 else (255, 0, 0)  # green / red (RGB)
-        cv2.circle(vis, (x, y), 6, colour, -1)
-        cv2.circle(vis, (x, y), 6, (255, 255, 255), 1)
-    return vis
-
-
-def _overlay_mask(
-    image: np.ndarray, mask: np.ndarray, colour=(0, 180, 0), alpha=0.45
-) -> np.ndarray:
-    """Blend a semi-transparent coloured mask onto *image* (RGB)."""
-    vis = image.copy().astype(np.float32)
-    overlay = np.full_like(vis, colour, dtype=np.float32)
-    m = mask.astype(bool)
-    vis[m] = (1 - alpha) * vis[m] + alpha * overlay[m]
-    return vis.astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# Multi-set helpers
-# ---------------------------------------------------------------------------
-
-# Distinct default colours assigned to new sets (RGB).
-PALETTE_RGB = [
-    (255, 64, 64),  # red
-    (64, 128, 255),  # blue
-    (64, 200, 96),  # green
-    (255, 176, 32),  # orange
-    (192, 64, 255),  # purple
-    (0, 200, 200),  # cyan
-    (255, 96, 160),  # pink
-    (160, 160, 64),  # olive
-]
-
-
-def _next_color(n: int) -> tuple[int, int, int]:
-    """Pick a distinct palette colour for the n-th set (cycles if needed)."""
-    return PALETTE_RGB[n % len(PALETTE_RGB)]
-
-
-def _new_set(color: tuple[int, int, int]) -> dict:
-    """Create an empty set record."""
-    return {
-        "dir": "",  # source folder
-        "frames": [],  # RGB frames (display + SAM)
-        "frames_bgr": [],  # BGR frames (compositing)
-        "points_map": {},  # dict[int, list[(x, y, label)]]
-        "masks": [],  # list[np.ndarray | None]
-        "color": color,  # (R, G, B)
-    }
-
-
-def _set_choices(sets: list) -> list[str]:
-    """Radio labels for the current sets."""
-    return [f"Set {i + 1}" for i in range(len(sets))]
-
-
-def _label_to_index(label, sets: list) -> int:
-    """Map a selector label back to its set index."""
-    choices = _set_choices(sets)
-    if label in choices:
-        return choices.index(label)
-    m = re.match(r"Set (\d+)", str(label or ""))
-    if m:
-        return min(max(int(m.group(1)) - 1, 0), max(len(sets) - 1, 0))
-    return 0
-
-
-def _rgb_to_hex(color: tuple[int, int, int]) -> str:
-    """(R, G, B) -> '#rrggbb' for the colour picker."""
-    r, g, b = color
-    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
-
-
-def _picker_hex(color, idx: int) -> str:
-    """Colour-picker hex for a set (placeholder palette colour if 'no colour')."""
-    return _rgb_to_hex(color if color is not None else _next_color(idx))
-
-
-def _parse_color(value) -> tuple[int, int, int] | None:
-    """Parse a picker value ('#rrggbb' or 'rgb(...)') to (R, G, B)."""
-    if not value:
-        return None
-    value = str(value).strip()
-    if value.startswith("#"):
-        h = value.lstrip("#")
-        if len(h) == 3:
-            h = "".join(c * 2 for c in h)
-        if len(h) >= 6:
-            return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
-        return None
-    if value.startswith("rgb"):
-        nums = re.findall(r"[\d.]+", value)
-        if len(nums) >= 3:
-            return tuple(int(round(float(n))) for n in nums[:3])
-    return None
-
-
-def _current_views(frames, points_map, idx, masks):
-    """Return (input_image, preview, points_map, masks) for the frame *idx*."""
-    if not frames:
-        return None, None, points_map, masks
-    rgb = frames[idx]
-    pts = points_map.get(idx, [])
-    img_with_points = _draw_points(rgb, pts)
-    mask = masks[idx] if masks and idx < len(masks) else None
-    preview = _overlay_mask(rgb, mask) if mask is not None else rgb.copy()
-    preview = _draw_points(preview, pts)
-    return img_with_points, preview, points_map, masks
-
-
-# ---------------------------------------------------------------------------
-# Directory browser
-# ---------------------------------------------------------------------------
-
-
-def _is_wsl() -> bool:
-    try:
-        return "microsoft" in Path("/proc/version").read_text().lower()
-    except OSError:
-        return False
-
-
-def browse_dir():
-    """Open a native OS directory picker and return the selected path."""
-    system = platform.system()
-    if system == "Linux" and _is_wsl():
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms;"
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                "$f.ShowDialog() | Out-Null;"
-                "$f.SelectedPath",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        path = result.stdout.strip()
-        if path:
-            wsl = subprocess.run(
-                ["wslpath", "-u", path],
-                capture_output=True,
-                text=True,
-            )
-            path = wsl.stdout.strip()
-    elif system == "Darwin":
-        result = subprocess.run(
-            ["osascript", "-e", "POSIX path of (choose folder)"],
-            capture_output=True,
-            text=True,
-        )
-        path = result.stdout.strip()
-    else:
-        result = subprocess.run(
-            [
-                "zenity",
-                "--file-selection",
-                "--directory",
-                "--title=Select directory",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        path = result.stdout.strip()
-    return path if path else gr.update()
-
-
-# ---------------------------------------------------------------------------
-# Set management callbacks
-# ---------------------------------------------------------------------------
-
-
-def add_set(sets: list):
-    """Append a new empty set, select it, and clear the workspace."""
-    color = _next_color(len(sets))
-    sets = sets + [_new_set(color)]
-    active = len(sets) - 1
-    return (
-        sets,  # st_sets
-        active,  # st_active
-        0,  # st_idx
-        gr.update(choices=_set_choices(sets), value=f"Set {active + 1}"),
-        None,  # input_image
-        None,  # preview_image
-        gr.update(maximum=0, value=0),  # frame_slider
-        _rgb_to_hex(color),  # color_picker
-        False,  # no_color_checkbox
-        gr.update(value=""),  # input_dir
-    )
-
-
-def remove_set(sets: list, active: int):
-    """Remove the active set; keep at least one set."""
-    sets = list(sets)
-    if 0 <= active < len(sets):
-        sets.pop(active)
-    if not sets:
-        sets = [_new_set(_next_color(0))]
-        active = 0
-    else:
-        active = min(active, len(sets) - 1)
-
-    s = sets[active]
-    if s["frames"]:
-        img, preview, _, _ = _current_views(s["frames"], s["points_map"], 0, s["masks"])
-        slider = gr.update(maximum=max(len(s["frames"]) - 1, 0), value=0)
-    else:
-        img, preview = None, None
-        slider = gr.update(maximum=0, value=0)
-
-    return (
-        sets,
-        active,
-        0,
-        gr.update(choices=_set_choices(sets), value=f"Set {active + 1}"),
-        img,
-        preview,
-        slider,
-        _picker_hex(s["color"], active),
-        s["color"] is None,
-        gr.update(value=s["dir"]),
-    )
-
-
-def select_set(sets: list, label):
-    """Switch the active set and repaint the workspace from its state."""
-    active = _label_to_index(label, sets)
-    s = sets[active]
-    if s["frames"]:
-        img, preview, _, _ = _current_views(s["frames"], s["points_map"], 0, s["masks"])
-        slider = gr.update(maximum=max(len(s["frames"]) - 1, 0), value=0)
-    else:
-        img, preview = None, None
-        slider = gr.update(maximum=0, value=0)
-    return (
-        active,  # st_active
-        0,  # st_idx
-        img,  # input_image
-        preview,  # preview_image
-        slider,  # frame_slider
-        _picker_hex(s["color"], active),  # color_picker
-        s["color"] is None,  # no_color_checkbox
-        gr.update(value=s["dir"]),  # input_dir
-    )
-
-
-def set_color(sets: list, active: int, value):
-    """Store a user-picked colour on the active set (clears 'no colour')."""
-    rgb = _parse_color(value)
-    if rgb is not None and 0 <= active < len(sets):
-        sets[active]["color"] = rgb
-    return sets, False  # picking a colour implies the set is coloured
-
-
-def toggle_no_color(sets: list, active: int, no_color: bool, picker_value):
-    """Toggle tinting for the active set; 'no colour' keeps original pixels."""
-    if 0 <= active < len(sets):
-        if no_color:
-            sets[active]["color"] = None
-        else:
-            sets[active]["color"] = _parse_color(picker_value) or _next_color(active)
-    return sets
-
-
-def set_background(sets: list, active: int, idx: int):
-    """Capture the active set's current frame as the composite background."""
-    if not (0 <= active < len(sets)):
-        return None, None
-    s = sets[active]
-    if not s["frames_bgr"]:
-        gr.Warning("Load images for this set first")
-        return None, None
-    idx = int(idx)
-    if idx >= len(s["frames_bgr"]):
-        idx = 0
-    bg_bgr = s["frames_bgr"][idx].copy()
-    bg_rgb = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2RGB)
-    return bg_bgr, bg_rgb
-
-
-# ---------------------------------------------------------------------------
-# Annotation callbacks (operate on the active set)
-# ---------------------------------------------------------------------------
-
-
-def load_dir(input_dir: str, sets: list, active: int):
-    """Load images from *input_dir* into the active set."""
-    p = Path(input_dir)
-    if not p.is_dir():
-        gr.Warning(f"Not a directory: {input_dir}")
-        return None, None, gr.update(), 0, sets
-
-    frames_bgr, _ = load_images(p)
-    if not frames_bgr:
-        gr.Warning("No images found in directory")
-        return None, None, gr.update(), 0, sets
-
-    frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr]
-
-    if not sets:
-        sets = [_new_set(_next_color(0))]
-        active = 0
-    s = sets[active]
-    s["dir"] = input_dir
-    s["frames"] = frames_rgb
-    s["frames_bgr"] = frames_bgr
-    s["points_map"] = {}
-    s["masks"] = [None] * len(frames_rgb)
-
-    first = frames_rgb[0]
-    return (
-        first,  # input_image
-        first,  # preview_image
-        gr.update(maximum=max(len(frames_rgb) - 1, 0), value=0),  # frame_slider
-        0,  # st_idx
-        sets,  # st_sets
-    )
-
-
-def on_image_click(
-    sets: list,
-    active: int,
-    current_idx: int,
-    evt: gr.SelectData,
-    mode: str,
-):
-    """Add a point to the active set's current frame and re-run SAM 3."""
-    if not (0 <= active < len(sets)):
-        return None, None, sets
-    s = sets[active]
-    if not s["frames"]:
-        return None, None, sets
-
-    label = 1 if mode == "Positive" else 0
-    x, y = evt.index
-
-    pts = s["points_map"].setdefault(current_idx, [])
-    pts.append((x, y, label))
-
-    rgb = s["frames"][current_idx]
-    mask = run_predictor_on_frame(rgb, pts)
-    s["masks"][current_idx] = mask
-
-    img_with_points = _draw_points(rgb, pts)
-    preview = _overlay_mask(rgb, mask) if mask is not None else rgb.copy()
-    preview = _draw_points(preview, pts)
-
-    return img_with_points, preview, sets
-
-
-def undo_point(sets: list, active: int, current_idx: int):
-    """Remove the last point for the active set's current frame."""
-    if not (0 <= active < len(sets)):
-        return None, None, sets
-    s = sets[active]
-    pts = s["points_map"].get(current_idx, [])
-    if pts:
-        pts.pop()
-        if pts:
-            rgb = s["frames"][current_idx]
-            s["masks"][current_idx] = run_predictor_on_frame(rgb, pts)
-        else:
-            s["masks"][current_idx] = None
-    img, preview, _, _ = _current_views(
-        s["frames"], s["points_map"], current_idx, s["masks"]
-    )
-    return img, preview, sets
-
-
-def clear_points(sets: list, active: int, current_idx: int):
-    """Clear all points and the mask for the active set's current frame."""
-    if not (0 <= active < len(sets)):
-        return None, None, sets
-    s = sets[active]
-    s["points_map"][current_idx] = []
-    if current_idx < len(s["masks"]):
-        s["masks"][current_idx] = None
-    img, preview, _, _ = _current_views(
-        s["frames"], s["points_map"], current_idx, s["masks"]
-    )
-    return img, preview, sets
-
-
-def change_frame(sets: list, active: int, frame_idx: int):
-    """Switch the displayed frame when the slider moves."""
-    idx = int(frame_idx)
-    if not (0 <= active < len(sets)) or not sets[active]["frames"]:
-        return None, None, idx
-    s = sets[active]
-    img, preview, _, _ = _current_views(s["frames"], s["points_map"], idx, s["masks"])
-    return img, preview, idx
-
-
-# ---------------------------------------------------------------------------
-# Composite
-# ---------------------------------------------------------------------------
-
-
-EMPHASIS_MODES = {
-    "None": "none",
-    "Last frame": "last",
-    "First & last frames": "first_last",
+from motion_trail.ui.render import (
+    DEFAULT_SETTINGS,
+    EMPHASIS_MODES,
+    generate_and_autosave,
+    generate_video_and_autosave,
+    restore_session_cb,
+    save_session_cb,
+)
+from motion_trail.ui.state import new_set, next_color, rgb_to_hex
+
+
+# Each workflow step is a card with its own accent colour.
+UI_CSS = """
+.step {
+    border: 1px solid var(--border-color-primary);
+    border-left: 6px solid var(--step-color);
+    border-radius: 12px;
+    padding: 12px 16px !important;
+    background: var(--block-background-fill);
 }
+.step-1 { --step-color: #6366f1; }
+.step-2 { --step-color: #0ea5e9; }
+.step-3 { --step-color: #10b981; }
+.step-4 { --step-color: #f59e0b; }
+.step-5 { --step-color: #ef4444; }
+.step-title h3 {
+    margin: 0;
+    font-size: 1.3rem;
+    color: var(--step-color);
+}
+.step-hint p { margin: 0; color: var(--body-text-color-subdued); }
+"""
 
 
-def generate_composite(
-    sets: list,
-    background,
-    alpha: float,
-    tint_strength: float,
-    emphasis_label: str,
-    output_path: str,
-):
-    """Overlay every annotated set's trail onto the chosen background."""
-    usable = [
-        s for s in sets if s["frames_bgr"] and any(m is not None for m in s["masks"])
-    ]
-    if not usable:
-        gr.Warning("No sets with masks – annotate at least one set first")
-        return None
-
-    if background is None:
-        background = usable[0]["frames_bgr"][0]
-
-    payload = [
-        {
-            "frames_bgr": s["frames_bgr"],
-            "masks": s["masks"],
-            # RGB -> BGR, or None to keep the object's original colours
-            "color_bgr": None if s["color"] is None else tuple(s["color"][::-1]),
-        }
-        for s in usable
-    ]
-    composite = compose_multi_set(
-        payload,
-        background,
-        alpha=alpha,
-        tint_strength=tint_strength,
-        emphasis=EMPHASIS_MODES.get(emphasis_label, "last"),
-    )
-
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), composite)
-
-    return cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
-
-
-# ---------------------------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------------------------
+@contextmanager
+def _step(n: int, title: str, hint: str = ""):
+    """A workflow-step card: numbered title, optional hint, then its widgets."""
+    with gr.Column(elem_classes=["step", f"step-{n}"]) as col:
+        gr.Markdown(f"### {n}. {title}", elem_classes=["step-title"])
+        if hint:
+            gr.Markdown(hint, elem_classes=["step-hint"])
+        yield col
 
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Motion Trail – SAM 3") as demo:
         gr.Markdown("# Motion Trail Image Creator (SAM 3)")
-        gr.Markdown(
-            "Load a folder per set, annotate each set, give it a colour, "
-            "pick a background frame, then overlay every trail."
-        )
 
-        init_color = _next_color(0)
+        init_color = next_color(0)
 
         # ---- state ----
-        st_sets = gr.State([_new_set(init_color)])  # list[set dict]
+        st_sets = gr.State([new_set(init_color)])  # list[set dict]
         st_active = gr.State(0)  # active set index
         st_idx = gr.State(0)  # current frame within active set
         st_bg = gr.State(None)  # chosen background frame (BGR)
+        st_video = gr.State(None)  # original path of the dropped video
 
-        # ---- set management ----
-        with gr.Row():
-            set_selector = gr.Radio(
-                choices=["Set 1"], value="Set 1", label="Active set", scale=4
+        with gr.Accordion("Session – save / restore work in progress", open=False):
+            with gr.Row():
+                session_name = gr.Textbox(
+                    label="Session name",
+                    placeholder="blank = timestamp",
+                    scale=3,
+                )
+                save_session_btn = gr.Button("Save session", scale=1)
+            autosave_checkbox = gr.Checkbox(
+                label="Autosave on generate",
+                value=True,
+                info="Updates the session named above after every image or video.",
             )
-            add_btn = gr.Button("+ Add Set", scale=1)
-            remove_btn = gr.Button("Remove Set", scale=1)
+            with gr.Row():
+                session_selector = gr.Dropdown(
+                    choices=list_sessions(),
+                    value=None,
+                    label="Saved sessions (newest first)",
+                    scale=3,
+                )
+                refresh_sessions_btn = gr.Button("Refresh list", scale=1)
+                restore_session_btn = gr.Button("Restore session", scale=1)
 
-        # ---- load ----
-        with gr.Row():
-            input_dir = gr.Textbox(
-                label="Input directory (active set)",
-                value="data/samples/",
-                scale=4,
-            )
-            browse_btn = gr.Button("Browse", scale=1)
-            load_btn = gr.Button("Load", scale=1)
+        with _step(
+            1,
+            "Choose a set",
+            "One set per object. Sets are drawn in order, so the **last set is "
+            "on top** where trails overlap.",
+        ):
+            with gr.Row():
+                set_selector = gr.Radio(
+                    choices=["Set 1"], value="Set 1", label="Active set", scale=4
+                )
+                add_btn = gr.Button("+ Add Set", scale=1)
+                remove_btn = gr.Button("Remove Set", scale=1)
+            with gr.Row():
+                move_earlier_btn = gr.Button("◀ Move earlier (behind)")
+                move_later_btn = gr.Button("▶ Move later (on top)")
+            with gr.Row():
+                color_picker = gr.ColorPicker(
+                    label="Set colour", value=rgb_to_hex(init_color)
+                )
+                no_color_checkbox = gr.Checkbox(
+                    label="No colour (keep original)", value=False
+                )
 
-        with gr.Row():
-            color_picker = gr.ColorPicker(
-                label="Set colour", value=_rgb_to_hex(init_color)
-            )
-            no_color_checkbox = gr.Checkbox(
-                label="No colour (keep original)", value=False
+        with _step(
+            2,
+            "Load frames",
+            "Drop an image folder to load it immediately, or drop a video, set "
+            "the range and click **Extract frames from video**.",
+        ):
+            with gr.Row():
+                image_drop = gr.File(
+                    label="Drop an image folder here",
+                    file_count="directory",
+                    height=120,
+                )
+                # a plain file box as the drop target, so the raw codec is never played
+                video_drop = gr.File(
+                    label="Drop a video here",
+                    file_count="single",
+                    file_types=sorted(VIDEO_EXTS),
+                    height=120,
+                )
+            video_player = gr.Video(label="Video preview", interactive=False)
+            with gr.Row():
+                start_sec = gr.Textbox(
+                    label="Start (video)",
+                    value=DEFAULT_SETTINGS["start_sec"],
+                    placeholder="sec or mm:ss.s, e.g. 1:23.5",
+                )
+                end_sec = gr.Textbox(
+                    label="End (0 = until end)",
+                    value=DEFAULT_SETTINGS["end_sec"],
+                    placeholder="sec or mm:ss.s, e.g. 2:05",
+                )
+                interval_sec = gr.Number(
+                    label="Interval (sec, video)",
+                    value=DEFAULT_SETTINGS["interval_sec"],
+                    minimum=0.01,
+                )
+                extract_btn = gr.Button("Extract frames from video", scale=1)
+
+        with _step(
+            3,
+            "Annotate each frame",
+            "Click the object (Positive) or areas to exclude (Negative); move "
+            "between frames with the slider.",
+        ):
+            with gr.Row():
+                input_image = gr.Image(label="Click to add points", interactive=False)
+                preview_image = gr.Image(label="Mask preview", interactive=False)
+            with gr.Row():
+                mode_radio = gr.Radio(
+                    ["Positive", "Negative"],
+                    value="Positive",
+                    label="Point mode",
+                )
+                undo_btn = gr.Button("Undo")
+                clear_btn = gr.Button("Clear")
+            frame_slider = gr.Slider(
+                minimum=0,
+                maximum=0,
+                step=1,
+                value=0,
+                label="Frame",
             )
 
-        # ---- images ----
-        with gr.Row():
-            input_image = gr.Image(label="Click to add points", interactive=False)
-            preview_image = gr.Image(label="Mask preview", interactive=False)
+        with _step(
+            4,
+            "Pick a background",
+            "Without one, the first frame of the first annotated set is used.",
+        ):
+            with gr.Row():
+                bg_btn = gr.Button("Use current frame as background")
+                bg_preview = gr.Image(label="Background", interactive=False)
 
-        # ---- controls ----
-        with gr.Row():
-            mode_radio = gr.Radio(
-                ["Positive", "Negative"],
-                value="Positive",
-                label="Point mode",
-            )
-            undo_btn = gr.Button("Undo")
-            clear_btn = gr.Button("Clear")
-
-        frame_slider = gr.Slider(
-            minimum=0,
-            maximum=0,
-            step=1,
-            value=0,
-            label="Frame",
-        )
-
-        # ---- background ----
-        with gr.Row():
-            bg_btn = gr.Button("Use current frame as background")
-            bg_preview = gr.Image(label="Background", interactive=False)
-
-        # ---- composite ----
-        with gr.Row():
-            alpha_slider = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Alpha")
-            tint_slider = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.05, label="Tint strength"
-            )
-            emphasis_radio = gr.Radio(
-                ["None", "Last frame", "First & last frames"],
-                value="Last frame",
-                label="Emphasize (opaque) frames",
-            )
-            out_path = gr.Textbox(
-                label="Output path", value="outputs/sample_result.png"
-            )
-            gen_btn = gr.Button("Generate Motion Trail", variant="primary")
-        result_image = gr.Image(label="Result", interactive=False)
+        with _step(5, "Generate"):
+            with gr.Row():
+                alpha_slider = gr.Slider(
+                    0.0, 1.0, value=DEFAULT_SETTINGS["alpha"], step=0.05, label="Alpha"
+                )
+                tint_slider = gr.Slider(
+                    0.0,
+                    1.0,
+                    value=DEFAULT_SETTINGS["tint_strength"],
+                    step=0.05,
+                    label="Tint strength",
+                )
+                emphasis_radio = gr.Radio(
+                    list(EMPHASIS_MODES),
+                    value=DEFAULT_SETTINGS["emphasis"],
+                    label="Emphasize (opaque) frames",
+                )
+            with gr.Row(equal_height=False):
+                with gr.Column():
+                    out_path = gr.Textbox(
+                        label="Output path (.png / .jpg / .webp / .bmp / .tiff)",
+                        value=DEFAULT_SETTINGS["output_path"],
+                    )
+                    gen_btn = gr.Button("Generate Motion Trail", variant="primary")
+                    # format=png only applies to an array (a format the browser can't show)
+                    result_image = gr.Image(
+                        label="Result", interactive=False, format="png"
+                    )
+                with gr.Column():
+                    with gr.Row():
+                        video_fps = gr.Number(
+                            label="Video FPS",
+                            value=DEFAULT_SETTINGS["video_fps"],
+                            minimum=0.1,
+                            info="Encoding rate only — the pace comes from Interval (sec).",
+                        )
+                        video_out_path = gr.Textbox(
+                            label="Video output path (.mp4 / .mov / .mkv / .avi)",
+                            value=DEFAULT_SETTINGS["video_output_path"],
+                        )
+                    gen_video_btn = gr.Button("Generate Trail Video", variant="primary")
+                    result_video = gr.Video(label="Trail video", interactive=False)
 
         # ---- wiring ----
-        # User-only events (.input / .release) so programmatic updates from
-        # add/remove/select/load do not re-trigger the same handlers.
+        # .input / .release so programmatic updates don't re-trigger handlers
         set_selector.input(
             select_set,
             inputs=[st_sets, set_selector],
@@ -594,7 +256,9 @@ def build_ui() -> gr.Blocks:
                 frame_slider,
                 color_picker,
                 no_color_checkbox,
-                input_dir,
+                start_sec,
+                end_sec,
+                interval_sec,
             ],
         )
 
@@ -611,7 +275,6 @@ def build_ui() -> gr.Blocks:
                 frame_slider,
                 color_picker,
                 no_color_checkbox,
-                input_dir,
             ],
         )
 
@@ -628,8 +291,22 @@ def build_ui() -> gr.Blocks:
                 frame_slider,
                 color_picker,
                 no_color_checkbox,
-                input_dir,
+                start_sec,
+                end_sec,
+                interval_sec,
             ],
+        )
+
+        move_earlier_btn.click(
+            lambda sets, active: move_set(sets, active, -1),
+            inputs=[st_sets, st_active],
+            outputs=[st_sets, st_active, set_selector, color_picker],
+        )
+
+        move_later_btn.click(
+            lambda sets, active: move_set(sets, active, 1),
+            inputs=[st_sets, st_active],
+            outputs=[st_sets, st_active, set_selector, color_picker],
         )
 
         color_picker.input(
@@ -644,17 +321,35 @@ def build_ui() -> gr.Blocks:
             outputs=[st_sets],
         )
 
-        browse_btn.click(browse_dir, inputs=[], outputs=[input_dir])
-
-        load_btn.click(
-            load_dir,
-            inputs=[input_dir, st_sets, st_active],
+        image_drop.upload(
+            load_image_files,
+            inputs=[image_drop, st_sets, st_active],
             outputs=[
                 input_image,
                 preview_image,
                 frame_slider,
                 st_idx,
                 st_sets,
+                video_player,
+            ],
+        )
+
+        video_drop.upload(
+            on_video_drop,
+            inputs=[video_drop],
+            outputs=[st_video, video_player],
+        )
+
+        extract_btn.click(
+            load_video_frames,
+            inputs=[st_video, st_sets, st_active, start_sec, end_sec, interval_sec],
+            outputs=[
+                input_image,
+                preview_image,
+                frame_slider,
+                st_idx,
+                st_sets,
+                video_player,
             ],
         )
 
@@ -688,17 +383,92 @@ def build_ui() -> gr.Blocks:
             outputs=[st_bg, bg_preview],
         )
 
+        render_inputs = [
+            st_sets,
+            st_bg,
+            alpha_slider,
+            tint_slider,
+            emphasis_radio,
+            out_path,
+            video_out_path,
+            video_fps,
+            st_active,
+            st_idx,
+            st_video,
+            session_name,
+            start_sec,
+            end_sec,
+            interval_sec,
+            autosave_checkbox,
+        ]
+
         gen_btn.click(
-            generate_composite,
+            generate_and_autosave,
+            inputs=render_inputs,
+            outputs=[result_image, session_selector, session_name],
+        )
+
+        gen_video_btn.click(
+            generate_video_and_autosave,
+            inputs=render_inputs,
+            outputs=[result_video, session_selector, session_name],
+        )
+
+        save_session_btn.click(
+            save_session_cb,
             inputs=[
                 st_sets,
+                st_active,
+                st_idx,
                 st_bg,
+                st_video,
+                session_name,
+                start_sec,
+                end_sec,
+                interval_sec,
                 alpha_slider,
                 tint_slider,
                 emphasis_radio,
                 out_path,
+                video_out_path,
+                video_fps,
             ],
-            outputs=[result_image],
+            outputs=[session_selector, session_name],
+        )
+
+        refresh_sessions_btn.click(
+            lambda: gr.update(choices=list_sessions()),
+            outputs=[session_selector],
+        )
+
+        restore_session_btn.click(
+            restore_session_cb,
+            inputs=[session_selector],
+            outputs=[
+                st_sets,
+                st_active,
+                st_idx,
+                st_bg,
+                st_video,
+                set_selector,
+                input_image,
+                preview_image,
+                frame_slider,
+                color_picker,
+                no_color_checkbox,
+                bg_preview,
+                video_player,
+                start_sec,
+                end_sec,
+                interval_sec,
+                alpha_slider,
+                tint_slider,
+                emphasis_radio,
+                out_path,
+                video_out_path,
+                video_fps,
+                session_name,
+            ],
         )
 
     return demo
@@ -706,4 +476,5 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch()
+    # serve videos from anywhere: a local, single-user tool
+    demo.launch(allowed_paths=["/"], css=UI_CSS)

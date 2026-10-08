@@ -35,23 +35,28 @@ Open http://127.0.0.1:7860 in your browser.
 
 ### Workflow
 
-1. **Load frames** -- Enter the directory path or click **Browse** to select a folder, then click **Load**.
+1. **Load frames** -- Drag & drop into the active set:
+   - **Image folder** -- Images (`.png`, `.jpg`, `.jpeg`) sorted by filename, so use zero-padded names (e.g. `frame_001.png`).
+   - **Video** -- Set **Start** / **End** (seconds or `mm:ss`; End `0` = whole clip) and **Interval (sec)**, then click **Extract frames from video**.
 2. **Annotate each frame** -- Use the frame slider to navigate between frames. For each frame:
    - Select **Positive** mode and click on the object to segment (green dots).
    - Select **Negative** mode and click on areas to exclude (red dots).
-   - The mask preview updates in real time after each click.
    - Use **Undo** to remove the last point or **Clear** to reset the current frame.
-3. **Generate composite** -- Adjust the **Alpha** blending slider and click **Generate Motion Trail**. The result is saved to the specified output path.
+3. **Add more objects** (optional) -- **+ Add Set** adds another object with its own frames and colour. The last set is drawn on top; reorder with **◀ / ▶**.
+4. **Generate** -- Pick a background with **Use current frame as background**, adjust **Alpha** / **Tint strength** / **Emphasize**, then click:
+   - **Generate Motion Trail** for a still image (`.png`, `.jpg`, `.webp`, `.bmp`, `.tiff`).
+   - **Generate Trail Video** for a video in which the trail grows over time (`.mp4`, `.mov`, `.mkv`, `.avi`; H.264 when `ffmpeg` is installed).
 
-### Preparing input images
+   The format follows the output path's extension.
 
-Place a sequence of images (`.png`, `.jpg`, `.jpeg`) in a directory. The images are sorted lexicographically, so use zero-padded filenames (e.g. `frame_001.png`, `frame_002.png`, ...) to ensure the correct order.
+### Saving and resuming work
+
+The **Session** panel saves all sets, annotations and settings to `sessions/<name>/`, and restores them later -- even after an app restart. With **Autosave** on, the session is saved every time you generate. Sessions store every frame as PNG and can be large, so delete ones you no longer need.
 
 ## How it works
 
 1. For each frame, SAM 3's interactive predictor segments the target object based on positive/negative point prompts.
-2. A static background is estimated by computing the per-pixel median across all frames.
-3. The segmented objects are composited onto the background: the first and last frames are pasted opaquely, while intermediate frames are alpha-blended to create the motion-trail effect.
+2. The segmented objects are alpha-blended onto the chosen background frame to create the motion-trail effect; the frames selected under **Emphasize** are pasted opaquely.
 
 ## License
 
